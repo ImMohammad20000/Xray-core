@@ -1,6 +1,8 @@
 package connectiontracker_test
 
 import (
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -232,6 +234,22 @@ func TestManagerCloseGlobalConnAcrossTrackers(t *testing.T) {
 	}
 }
 
+func TestCloseGlobalConnClosesTransport(t *testing.T) {
+	manager := connectiontracker.NewManager()
+	tracker := manager.NewTracker()
+
+	id, entry := tracker.RegisterWithMeta("user@example.com", func() {}, "", "")
+	fc := &fakeConn{}
+	connectiontracker.WrapConn(fc, entry)
+
+	if !manager.CloseGlobalConn(id) {
+		t.Fatal("CloseGlobalConn: expected true for existing connection")
+	}
+	if got := fc.CloseCount(); got != 1 {
+		t.Fatalf("transport close count: got %d, want 1", got)
+	}
+}
+
 func TestListConnectionsEmptyAfterCancelAll(t *testing.T) {
 	tracker := connectiontracker.New()
 
@@ -268,6 +286,10 @@ func TestCloseConnCancelsAndRemoves(t *testing.T) {
 	if atomic.LoadInt32(&cancelled) != 1 {
 		t.Error("CloseConn: cancel function was not called")
 	}
+	if len(tracker.ListConnections()) != 0 {
+		t.Error("closing connection should not appear in active list")
+	}
+	tracker.Unregister("user@example.com", id)
 	if len(tracker.ListConnections()) != 0 {
 		t.Error("connection still present after CloseConn")
 	}
@@ -327,6 +349,133 @@ func TestGetConnCountDecreasesAfterUnregister(t *testing.T) {
 	}
 }
 
+func TestCloseConnKeepsStatsUntilUnregister(t *testing.T) {
+	manager := connectiontracker.NewManager()
+	tracker := manager.NewTracker()
+
+	id, entry := tracker.RegisterWithMeta("user@example.com", func() {}, "", "")
+	conn := connectiontracker.WrapConn(&fakeConn{readData: make([]byte, 10)}, entry)
+	if _, err := conn.Read(make([]byte, 10)); err != nil {
+		t.Fatalf("read before close failed: %v", err)
+	}
+
+	blocked := newBlockingFakeConn()
+	conn = connectiontracker.WrapConn(blocked, entry)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(make([]byte, 5))
+		writeDone <- err
+	}()
+	blocked.WaitForWrite()
+
+	if ok := tracker.CloseConn(id); !ok {
+		t.Fatal("CloseConn: expected true for existing connection")
+	}
+	if got := blocked.CloseCount(); got != 1 {
+		t.Fatalf("transport close count: got %d, want 1", got)
+	}
+	if err := <-writeDone; err == nil {
+		t.Fatal("expected in-flight write to terminate with an error")
+	}
+
+	uplink, downlink, connCount := manager.GetUserStats("user@example.com")
+	if uplink != 10 || downlink != 5 {
+		t.Fatalf("GetUserStats after close: got uplink=%d downlink=%d, want 10/5", uplink, downlink)
+	}
+	if connCount != 0 {
+		t.Fatalf("GetUserStats connCount after close: got %d, want 0", connCount)
+	}
+
+	tracker.Unregister("user@example.com", id)
+}
+
+func TestDisconnectEventUsesFinalCountersAfterForcedClose(t *testing.T) {
+	manager := connectiontracker.NewManager()
+	tracker := manager.NewTracker()
+	ch := manager.Subscribe()
+	defer manager.Unsubscribe(ch)
+
+	id, entry := tracker.RegisterWithMeta("user@example.com", func() {}, "", "")
+	<-ch // connected event
+
+	conn := connectiontracker.WrapConn(&fakeConn{readData: make([]byte, 7)}, entry)
+	if _, err := conn.Read(make([]byte, 7)); err != nil {
+		t.Fatalf("read before close failed: %v", err)
+	}
+
+	blocked := newBlockingFakeConn()
+	conn = connectiontracker.WrapConn(blocked, entry)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(make([]byte, 9))
+		writeDone <- err
+	}()
+	blocked.WaitForWrite()
+
+	if ok := tracker.CloseConn(id); !ok {
+		t.Fatal("CloseConn: expected true for existing connection")
+	}
+	if err := <-writeDone; err == nil {
+		t.Fatal("expected in-flight write to terminate with an error")
+	}
+
+	tracker.Unregister("user@example.com", id)
+
+	select {
+	case ev := <-ch:
+		if ev.Connected {
+			t.Fatal("expected disconnect event")
+		}
+		if ev.Info.Uplink != 7 || ev.Info.Downlink != 9 {
+			t.Fatalf("disconnect counters: got uplink=%d downlink=%d, want 7/9", ev.Info.Uplink, ev.Info.Downlink)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for disconnect event")
+	}
+}
+
+func TestRepeatedForcedCloseIsIdempotent(t *testing.T) {
+	tracker := connectiontracker.New()
+
+	var cancelled int32
+	id, _ := tracker.RegisterWithMeta("user@example.com", func() {
+		atomic.AddInt32(&cancelled, 1)
+	}, "", "")
+
+	if !tracker.CloseConn(id) {
+		t.Fatal("first CloseConn should find connection")
+	}
+	if !tracker.CloseConn(id) {
+		t.Fatal("second CloseConn should still find tracked connection before Unregister")
+	}
+	tracker.CancelAll("user@example.com")
+
+	if got := atomic.LoadInt32(&cancelled); got != 1 {
+		t.Fatalf("cancel count: got %d, want 1", got)
+	}
+}
+
+func TestCancelAllClosesAttachedTransports(t *testing.T) {
+	tracker := connectiontracker.New()
+
+	_, firstEntry := tracker.RegisterWithMeta("user@example.com", func() {}, "", "")
+	firstConn := &fakeConn{}
+	connectiontracker.WrapConn(firstConn, firstEntry)
+
+	_, secondEntry := tracker.RegisterWithMeta("user@example.com", func() {}, "", "")
+	secondConn := &fakeConn{}
+	connectiontracker.WrapConn(secondConn, secondEntry)
+
+	tracker.CancelAll("user@example.com")
+
+	if got := firstConn.CloseCount(); got != 1 {
+		t.Fatalf("first transport close count: got %d, want 1", got)
+	}
+	if got := secondConn.CloseCount(); got != 1 {
+		t.Fatalf("second transport close count: got %d, want 1", got)
+	}
+}
+
 func TestListConnectionsMetadataFields(t *testing.T) {
 	tracker := connectiontracker.New()
 
@@ -357,23 +506,77 @@ type fakeConn struct {
 	readData []byte
 	readErr  error
 	writeErr error
+	closed   atomic.Bool
+	closeCnt atomic.Int32
 }
 
 func (f *fakeConn) Read(b []byte) (int, error) {
+	if f.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	n := copy(b, f.readData)
 	return n, f.readErr
 }
 
 func (f *fakeConn) Write(b []byte) (int, error) {
+	if f.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	return len(b), f.writeErr
 }
 
-func (f *fakeConn) Close() error                       { return nil }
+func (f *fakeConn) Close() error {
+	f.closeCnt.Add(1)
+	f.closed.Store(true)
+	return nil
+}
 func (f *fakeConn) LocalAddr() net.Addr                { return nil }
 func (f *fakeConn) RemoteAddr() net.Addr               { return nil }
 func (f *fakeConn) SetDeadline(_ time.Time) error      { return nil }
 func (f *fakeConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (f *fakeConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+func (f *fakeConn) CloseCount() int32 {
+	return f.closeCnt.Load()
+}
+
+type blockingFakeConn struct {
+	fakeConn
+	writeStarted chan struct{}
+	closeSignal  chan struct{}
+}
+
+func newBlockingFakeConn() *blockingFakeConn {
+	return &blockingFakeConn{
+		writeStarted: make(chan struct{}),
+		closeSignal:  make(chan struct{}),
+	}
+}
+
+func (f *blockingFakeConn) Write(b []byte) (int, error) {
+	if f.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	select {
+	case <-f.writeStarted:
+	default:
+		close(f.writeStarted)
+	}
+	<-f.closeSignal
+	return len(b), io.ErrClosedPipe
+}
+
+func (f *blockingFakeConn) Close() error {
+	if f.closed.CompareAndSwap(false, true) {
+		f.closeCnt.Add(1)
+		close(f.closeSignal)
+	}
+	return nil
+}
+
+func (f *blockingFakeConn) WaitForWrite() {
+	<-f.writeStarted
+}
 
 func TestWrapConnCountsUplinkOnRead(t *testing.T) {
 	tracker := connectiontracker.New()
@@ -447,6 +650,7 @@ type fakePacketConn struct {
 	readPacketData *B.Buffer
 	readPacketErr  error
 	writePacketErr error
+	closeCnt       atomic.Int32
 }
 
 func (f *fakePacketConn) ReadPacket(buffer *B.Buffer) (M.Socksaddr, error) {
@@ -464,6 +668,7 @@ func (f *fakePacketConn) WritePacket(buffer *B.Buffer, _ M.Socksaddr) error {
 }
 
 func (f *fakePacketConn) Close() error {
+	f.closeCnt.Add(1)
 	return nil
 }
 
@@ -481,6 +686,10 @@ func (f *fakePacketConn) SetReadDeadline(_ time.Time) error {
 
 func (f *fakePacketConn) SetWriteDeadline(_ time.Time) error {
 	return nil
+}
+
+func (f *fakePacketConn) CloseCount() int32 {
+	return f.closeCnt.Load()
 }
 
 func TestWrapPacketConnCountsUplinkOnReadPacket(t *testing.T) {
@@ -556,5 +765,46 @@ func TestWrapPacketConnUpdatesLastActivity(t *testing.T) {
 	after := tracker.ListConnections()[0].LastActivity
 	if !after.After(before) {
 		t.Errorf("LastActivity not updated: before=%v after=%v", before, after)
+	}
+}
+
+func TestCloseConnClosesPacketTransport(t *testing.T) {
+	tracker := connectiontracker.New()
+
+	id, entry := tracker.RegisterWithMeta("user@example.com", func() {}, "", "")
+	fpc := &fakePacketConn{}
+	connectiontracker.WrapPacketConn(fpc, entry)
+
+	if !tracker.CloseConn(id) {
+		t.Fatal("CloseConn: expected true for existing connection")
+	}
+	if got := fpc.CloseCount(); got != 1 {
+		t.Fatalf("packet transport close count: got %d, want 1", got)
+	}
+}
+
+func TestWrapConnCountsBytesBeforeErrors(t *testing.T) {
+	tracker := connectiontracker.New()
+	_, entry := tracker.RegisterWithMeta("user@example.com", func() {}, "", "")
+
+	wrapped := connectiontracker.WrapConn(&fakeConn{
+		readData:  []byte("hello"),
+		readErr:   errors.New("read stopped"),
+		writeErr:  errors.New("write stopped"),
+	}, entry)
+
+	if _, err := wrapped.Read(make([]byte, 5)); err == nil {
+		t.Fatal("expected read error")
+	}
+	if _, err := wrapped.Write([]byte("bye")); err == nil {
+		t.Fatal("expected write error")
+	}
+
+	conns := tracker.ListConnections()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 connection")
+	}
+	if conns[0].Uplink != 5 || conns[0].Downlink != 3 {
+		t.Fatalf("counters with errors: got uplink=%d downlink=%d, want 5/3", conns[0].Uplink, conns[0].Downlink)
 	}
 }

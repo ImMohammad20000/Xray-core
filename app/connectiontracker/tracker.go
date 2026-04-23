@@ -29,6 +29,12 @@ type ConnEntry struct {
 	lastActivity int64 // atomic, Unix nanosecond timestamp
 	uplink       int64 // atomic, bytes received from client
 	downlink     int64 // atomic, bytes sent to client
+	closing      atomic.Bool
+
+	closeMu         sync.Mutex
+	closeTransport  func()
+	cancelOnce      sync.Once
+	transportClosed sync.Once
 }
 
 // ConnectionInfo is a read-only snapshot of an active connection's state.
@@ -295,6 +301,58 @@ func disconnectInfo(id uint32, entry *ConnEntry) ConnectionInfo {
 	}
 }
 
+func (e *ConnEntry) isClosing() bool {
+	return e != nil && e.closing.Load()
+}
+
+func (e *ConnEntry) beginClose() bool {
+	return e != nil && e.closing.CompareAndSwap(false, true)
+}
+
+func (e *ConnEntry) attachCloseTransport(closeFn func()) {
+	if e == nil || closeFn == nil {
+		return
+	}
+
+	e.closeMu.Lock()
+	e.closeTransport = closeFn
+	closing := e.closing.Load()
+	e.closeMu.Unlock()
+
+	if closing {
+		e.forceCloseTransport()
+	}
+}
+
+func (e *ConnEntry) forceCloseTransport() {
+	if e == nil {
+		return
+	}
+
+	e.transportClosed.Do(func() {
+		e.closeMu.Lock()
+		closeFn := e.closeTransport
+		e.closeMu.Unlock()
+
+		if closeFn != nil {
+			closeFn()
+		}
+	})
+}
+
+func (e *ConnEntry) forceClose() {
+	if e == nil || !e.beginClose() {
+		return
+	}
+
+	e.cancelOnce.Do(func() {
+		if e.Cancel != nil {
+			e.Cancel()
+		}
+	})
+	e.forceCloseTransport()
+}
+
 // ListAllConnections returns a snapshot of every active connection across all
 // Tracker instances that were created by NewTracker.
 func (m *Manager) ListAllConnections() []ConnectionInfo {
@@ -315,7 +373,9 @@ func (m *Manager) GetUserStats(email string) (uplink, downlink int64, connCount 
 		for _, e := range t.conns[email] {
 			uplink += atomic.LoadInt64(&e.uplink)
 			downlink += atomic.LoadInt64(&e.downlink)
-			connCount++
+			if !e.isClosing() {
+				connCount++
+			}
 		}
 		t.mu.Unlock()
 	}
@@ -393,19 +453,14 @@ func (t *Tracker) Unregister(email string, id uint32) {
 // CancelAll cancels every active connection belonging to email.
 func (t *Tracker) CancelAll(email string) {
 	t.mu.Lock()
-	entries := t.conns[email]
-	delete(t.conns, email)
-	for id := range entries {
-		delete(t.byID, id)
+	entries := make(map[uint32]*ConnEntry)
+	for id, entry := range t.conns[email] {
+		entries[id] = entry
 	}
 	t.mu.Unlock()
 
-	for id, entry := range entries {
-		t.manager.emit(WatchEvent{
-			Connected: false,
-			Info:      disconnectInfo(id, entry),
-		})
-		entry.Cancel()
+	for _, entry := range entries {
+		entry.forceClose()
 	}
 }
 
@@ -414,23 +469,10 @@ func (t *Tracker) CancelAll(email string) {
 func (t *Tracker) CloseConn(id uint32) bool {
 	t.mu.Lock()
 	entry, ok := t.byID[id]
-	if ok {
-		delete(t.byID, id)
-		if m := t.conns[entry.Email]; m != nil {
-			delete(m, id)
-			if len(m) == 0 {
-				delete(t.conns, entry.Email)
-			}
-		}
-	}
 	t.mu.Unlock()
 
 	if ok {
-		t.manager.emit(WatchEvent{
-			Connected: false,
-			Info:      disconnectInfo(id, entry),
-		})
-		entry.Cancel()
+		entry.forceClose()
 	}
 	return ok
 }
@@ -438,7 +480,12 @@ func (t *Tracker) CloseConn(id uint32) bool {
 // GetConnCount returns the number of active connections for email.
 func (t *Tracker) GetConnCount(email string) int {
 	t.mu.Lock()
-	n := len(t.conns[email])
+	n := 0
+	for _, entry := range t.conns[email] {
+		if !entry.isClosing() {
+			n++
+		}
+	}
 	t.mu.Unlock()
 	return n
 }
@@ -448,6 +495,9 @@ func (t *Tracker) ListConnections() []ConnectionInfo {
 	t.mu.Lock()
 	result := make([]ConnectionInfo, 0, len(t.byID))
 	for id, entry := range t.byID {
+		if entry.isClosing() {
+			continue
+		}
 		info := disconnectInfo(id, entry)
 		info.Uplink = atomic.LoadInt64(&entry.uplink)
 		info.Downlink = atomic.LoadInt64(&entry.downlink)
@@ -496,6 +546,9 @@ func (c *TrackedConn) Write(b []byte) (int, error) {
 // WrapConn wraps conn so that every Read and Write updates the traffic
 // counters in entry. Call after RegisterWithMeta to enable byte-level tracking.
 func WrapConn(conn stat.Connection, entry *ConnEntry) stat.Connection {
+	entry.attachCloseTransport(func() {
+		_ = common.Interrupt(conn)
+	})
 	return &TrackedConn{Connection: conn, entry: entry}
 }
 
@@ -538,6 +591,9 @@ func (c *TrackedPacketConn) WritePacket(buffer *B.Buffer, destination M.Socksadd
 // updates the traffic counters in entry. Call after RegisterWithMeta to enable
 // byte-level tracking for UDP connections.
 func WrapPacketConn(conn N.PacketConn, entry *ConnEntry) N.PacketConn {
+	entry.attachCloseTransport(func() {
+		_ = common.Interrupt(conn)
+	})
 	return &TrackedPacketConn{PacketConn: conn, entry: entry}
 }
 
