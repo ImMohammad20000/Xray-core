@@ -161,7 +161,13 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 	if user != nil && len(user.Email) > 0 {
 		p := d.policy.ForLevel(user.Level)
-		if p.Stats.UserUplink {
+
+		// Check if inbound stats are already being applied to avoid double-counting
+		// when both inbound stats and user stats are enabled
+		systemPolicy := d.policy.ForSystem()
+		inboundStatsEnabled := systemPolicy.Stats.InboundUplink || systemPolicy.Stats.InboundDownlink
+
+		if p.Stats.UserUplink && !inboundStatsEnabled {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				inboundLink.Writer = &SizeStatWriter{
@@ -170,7 +176,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 				}
 			}
 		}
-		if p.Stats.UserDownlink {
+		if p.Stats.UserDownlink && !inboundStatsEnabled {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
 				outboundLink.Writer = &SizeStatWriter{
@@ -199,13 +205,19 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
-		if p.Stats.UserUplink {
+
+		// Check if inbound stats are already being applied to avoid double-counting
+		// when both inbound stats and user stats are enabled
+		systemPolicy := policyManager.ForSystem()
+		inboundStatsEnabled := systemPolicy.Stats.InboundUplink || systemPolicy.Stats.InboundDownlink
+
+		if p.Stats.UserUplink && !inboundStatsEnabled {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
 				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
 			}
 		}
-		if p.Stats.UserDownlink {
+		if p.Stats.UserDownlink && !inboundStatsEnabled {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
 				link.Writer = &SizeStatWriter{
