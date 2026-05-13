@@ -153,44 +153,6 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		Writer: downlinkWriter,
 	}
 
-	sessionInbound := session.InboundFromContext(ctx)
-	var user *protocol.MemoryUser
-	if sessionInbound != nil {
-		user = sessionInbound.User
-	}
-
-	if user != nil && len(user.Email) > 0 {
-		p := d.policy.ForLevel(user.Level)
-
-		// Check if inbound stats are already being applied to avoid double-counting
-		// when both inbound stats and user stats are enabled
-		systemPolicy := d.policy.ForSystem()
-		inboundStatsEnabled := systemPolicy.Stats.InboundUplink || systemPolicy.Stats.InboundDownlink
-
-		if p.Stats.UserUplink && !inboundStatsEnabled {
-			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				inboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  inboundLink.Writer,
-				}
-			}
-		}
-		if p.Stats.UserDownlink && !inboundStatsEnabled {
-			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				outboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  outboundLink.Writer,
-				}
-			}
-		}
-
-		if p.Stats.UserOnline {
-			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
-		}
-	}
-
 	return inboundLink, outboundLink
 }
 
@@ -205,19 +167,13 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
-
-		// Check if inbound stats are already being applied to avoid double-counting
-		// when both inbound stats and user stats are enabled
-		systemPolicy := policyManager.ForSystem()
-		inboundStatsEnabled := systemPolicy.Stats.InboundUplink || systemPolicy.Stats.InboundDownlink
-
-		if p.Stats.UserUplink && !inboundStatsEnabled {
+		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
 				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
 			}
 		}
-		if p.Stats.UserDownlink && !inboundStatsEnabled {
+		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
 				link.Writer = &SizeStatWriter{
