@@ -5,6 +5,7 @@ package connectiontracker
 
 import (
 	"context"
+	"hash/maphash"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -32,7 +33,7 @@ type ConnEntry struct {
 
 // ConnectionInfo is a read-only snapshot of an active connection's state.
 type ConnectionInfo struct {
-	ID           uint32
+	ID           uint64
 	Email        string
 	InboundTag   string
 	Protocol     string
@@ -45,7 +46,7 @@ type ConnectionInfo struct {
 // Manager holds the shared connection registry and subscription fan-out for
 // a single Xray instance.
 type Manager struct {
-	globalNext uint32
+	globalNext uint64
 
 	globalMu sync.Mutex
 	trackers []*Tracker
@@ -54,14 +55,48 @@ type Manager struct {
 	subscribers []chan WatchEvent
 }
 
+// shardCount is the number of lock shards for each index. A power of two so
+// the shard can be selected with a mask. 64 spreads contention well across the
+// many goroutines a busy proxy runs without wasting much memory per Tracker.
+const (
+	shardCount = 64
+	shardMask  = shardCount - 1
+)
+
+// emailHashSeed seeds the email->shard hash. Process-local; it only affects
+// shard distribution, never correctness.
+var emailHashSeed = maphash.MakeSeed()
+
+// idShard holds one slice of the flat id->entry index under its own lock.
+// Sharding by connection ID spreads Register/Unregister/CloseConn contention.
+type idShard struct {
+	mu   sync.RWMutex
+	byID map[uint64]*ConnEntry
+}
+
+// emailShard holds one slice of the per-email grouping under its own lock. The
+// grouping powers CancelAll, GetConnCount, and per-user stats.
+type emailShard struct {
+	mu      sync.RWMutex
+	byEmail map[string]map[uint64]*ConnEntry // email -> id -> entry
+}
+
 // Tracker tracks active connections per user, enabling forced disconnection
 // and real-time connection inspection.
+//
+// It keeps two sharded indexes that always move together:
+//   - ids:    id -> entry, sharded by id, for O(1) lookup/removal by id.
+//   - emails: email -> {id -> entry}, sharded by email, for per-user ops.
+//
+// Sharded RWMutexes were chosen over a single mutex (serializes every op) and
+// over sync.Map (boxes keys, slower bulk CancelAll): reads take read locks and
+// independent connections fall on different shards, so the hot paths rarely
+// contend. A Tracker must not be copied after first use.
 type Tracker struct {
 	manager *Manager
 
-	mu    sync.Mutex
-	conns map[string]map[uint32]*ConnEntry // [email][id] -> entry
-	byID  map[uint32]*ConnEntry            // flat index for O(1) lookup by ID
+	ids    [shardCount]idShard
+	emails [shardCount]emailShard
 }
 
 // WatchEvent is delivered to subscribers whenever a connection opens or closes.
@@ -136,10 +171,12 @@ func (m *Manager) emit(ev WatchEvent) {
 // NewTracker creates a new, empty Tracker and registers it in the manager so
 // that ListAllConnections and CloseGlobalConn can see its connections.
 func (m *Manager) NewTracker() *Tracker {
-	t := &Tracker{
-		manager: m,
-		conns:   make(map[string]map[uint32]*ConnEntry),
-		byID:    make(map[uint32]*ConnEntry),
+	t := &Tracker{manager: m}
+	for i := range t.ids {
+		t.ids[i].byID = make(map[uint64]*ConnEntry)
+	}
+	for i := range t.emails {
+		t.emails[i].byEmail = make(map[string]map[uint64]*ConnEntry)
 	}
 	m.globalMu.Lock()
 	m.trackers = append(m.trackers, t)
@@ -152,7 +189,65 @@ func New() *Tracker {
 	return NewManager().NewTracker()
 }
 
-func disconnectInfo(id uint32, entry *ConnEntry) ConnectionInfo {
+func (t *Tracker) idShard(id uint64) *idShard {
+	return &t.ids[id&shardMask]
+}
+
+func (t *Tracker) emailShard(email string) *emailShard {
+	return &t.emails[maphash.String(emailHashSeed, email)&shardMask]
+}
+
+// addEntry inserts entry into both indexes. The two indexes always move
+// together; this is the single place that establishes that invariant.
+func (t *Tracker) addEntry(id uint64, email string, entry *ConnEntry) {
+	is := t.idShard(id)
+	is.mu.Lock()
+	is.byID[id] = entry
+	is.mu.Unlock()
+
+	es := t.emailShard(email)
+	es.mu.Lock()
+	bucket := es.byEmail[email]
+	if bucket == nil {
+		bucket = make(map[uint64]*ConnEntry)
+		es.byEmail[email] = bucket
+	}
+	bucket[id] = entry
+	es.mu.Unlock()
+}
+
+// takeID removes id from the flat index and reports whether this call is the
+// one that removed it. It is the exactly-once guard shared by Unregister,
+// CloseConn, and CancelAll: only the winner emits and cancels, even when they
+// race for the same connection.
+func (t *Tracker) takeID(id uint64) (*ConnEntry, bool) {
+	is := t.idShard(id)
+	is.mu.Lock()
+	entry, ok := is.byID[id]
+	if ok {
+		delete(is.byID, id)
+	}
+	is.mu.Unlock()
+	return entry, ok
+}
+
+// removeFromEmail drops id from email's grouping and reclaims the bucket once
+// it empties. Under the email shard lock add and remove are mutually exclusive,
+// so reclaiming here is race-free.
+func (t *Tracker) removeFromEmail(email string, id uint64) {
+	es := t.emailShard(email)
+	es.mu.Lock()
+	if bucket := es.byEmail[email]; bucket != nil {
+		delete(bucket, id)
+		if len(bucket) == 0 {
+			delete(es.byEmail, email)
+		}
+	}
+	es.mu.Unlock()
+}
+
+// snapshot builds a read-only ConnectionInfo for an event or a listing.
+func snapshot(id uint64, entry *ConnEntry) ConnectionInfo {
 	return ConnectionInfo{
 		ID:           id,
 		Email:        entry.Email,
@@ -181,20 +276,31 @@ func (m *Manager) ListAllConnections() []ConnectionInfo {
 func (m *Manager) GetUserStats(email string) (uplink, downlink int64, connCount int32) {
 	ts := m.snapshotTrackers()
 	for _, t := range ts {
-		t.mu.Lock()
-		for _, e := range t.conns[email] {
-			uplink += atomic.LoadInt64(&e.uplink)
-			downlink += atomic.LoadInt64(&e.downlink)
-			connCount++
-		}
-		t.mu.Unlock()
+		u, d, c := t.userStats(email)
+		uplink += u
+		downlink += d
+		connCount += c
 	}
+	return
+}
+
+// userStats sums the traffic counters and counts the live connections for
+// email within this Tracker.
+func (t *Tracker) userStats(email string) (uplink, downlink int64, connCount int32) {
+	es := t.emailShard(email)
+	es.mu.RLock()
+	for _, e := range es.byEmail[email] {
+		uplink += atomic.LoadInt64(&e.uplink)
+		downlink += atomic.LoadInt64(&e.downlink)
+		connCount++
+	}
+	es.mu.RUnlock()
 	return
 }
 
 // CloseGlobalConn closes the connection with the given ID in whichever Tracker
 // owns it. Returns true if the connection was found and cancelled.
-func (m *Manager) CloseGlobalConn(id uint32) bool {
+func (m *Manager) CloseGlobalConn(id uint64) bool {
 	ts := m.snapshotTrackers()
 	for _, t := range ts {
 		if t.CloseConn(id) {
@@ -206,7 +312,7 @@ func (m *Manager) CloseGlobalConn(id uint32) bool {
 
 // Register records a connection's cancel function under email and returns its
 // ID. Use RegisterWithMeta for richer per-connection tracking.
-func (t *Tracker) Register(email string, cancel context.CancelFunc) uint32 {
+func (t *Tracker) Register(email string, cancel context.CancelFunc) uint64 {
 	id, _ := t.RegisterWithMeta(email, cancel, "", "")
 	return id
 }
@@ -214,7 +320,7 @@ func (t *Tracker) Register(email string, cancel context.CancelFunc) uint32 {
 // RegisterWithMeta records a connection with full metadata and returns the
 // connection ID and a *ConnEntry whose traffic counters can be updated by
 // passing it to WrapConn.
-func (t *Tracker) RegisterWithMeta(email string, cancel context.CancelFunc, inboundTag, protocol string) (uint32, *ConnEntry) {
+func (t *Tracker) RegisterWithMeta(email string, cancel context.CancelFunc, inboundTag, protocol string) (uint64, *ConnEntry) {
 	now := time.Now()
 	entry := &ConnEntry{
 		Email:      email,
@@ -224,14 +330,8 @@ func (t *Tracker) RegisterWithMeta(email string, cancel context.CancelFunc, inbo
 		StartTime:  now,
 	}
 	atomic.StoreInt64(&entry.lastActivity, now.UnixNano())
-	id := atomic.AddUint32(&t.manager.globalNext, 1)
-	t.mu.Lock()
-	if t.conns[email] == nil {
-		t.conns[email] = make(map[uint32]*ConnEntry)
-	}
-	t.conns[email][id] = entry
-	t.byID[id] = entry
-	t.mu.Unlock()
+	id := atomic.AddUint64(&t.manager.globalNext, 1)
+	t.addEntry(id, email, entry)
 	t.manager.emit(WatchEvent{Connected: true, Info: ConnectionInfo{
 		ID:           id,
 		Email:        email,
@@ -244,86 +344,71 @@ func (t *Tracker) RegisterWithMeta(email string, cancel context.CancelFunc, inbo
 }
 
 // Unregister removes a connection from the tracker when it closes naturally.
-func (t *Tracker) Unregister(email string, id uint32) {
-	t.mu.Lock()
-	entry := t.byID[id]
-	delete(t.byID, id)
-	if m := t.conns[email]; m != nil {
-		delete(m, id)
-		if len(m) == 0 {
-			delete(t.conns, email)
-		}
+func (t *Tracker) Unregister(email string, id uint64) {
+	entry, ok := t.takeID(id)
+	if !ok {
+		return
 	}
-	t.mu.Unlock()
-	if entry != nil {
-		t.manager.emit(WatchEvent{Connected: false, Info: disconnectInfo(id, entry)})
-	}
+	t.removeFromEmail(email, id)
+	t.manager.emit(WatchEvent{Connected: false, Info: snapshot(id, entry)})
 }
 
 // CancelAll cancels every active connection belonging to email.
 func (t *Tracker) CancelAll(email string) {
-	t.mu.Lock()
-	entries := t.conns[email]
-	delete(t.conns, email)
-	for id := range entries {
-		delete(t.byID, id)
-	}
-	t.mu.Unlock()
+	es := t.emailShard(email)
+	es.mu.Lock()
+	bucket := es.byEmail[email]
+	delete(es.byEmail, email)
+	es.mu.Unlock()
 
-	for id, entry := range entries {
-		t.manager.emit(WatchEvent{
-			Connected: false,
-			Info:      disconnectInfo(id, entry),
-		})
-		entry.cancelAndClose()
+	for id, entry := range bucket {
+		// takeID is the exactly-once guard against a racing CloseConn.
+		if _, won := t.takeID(id); won {
+			t.manager.emit(WatchEvent{Connected: false, Info: snapshot(id, entry)})
+			entry.cancelAndClose()
+		}
 	}
 }
 
 // CloseConn cancels the connection identified by id.
 // Returns true if the connection was found and cancelled.
-func (t *Tracker) CloseConn(id uint32) bool {
-	t.mu.Lock()
-	entry, ok := t.byID[id]
-	if ok {
-		delete(t.byID, id)
-		if m := t.conns[entry.Email]; m != nil {
-			delete(m, id)
-			if len(m) == 0 {
-				delete(t.conns, entry.Email)
-			}
-		}
+func (t *Tracker) CloseConn(id uint64) bool {
+	entry, ok := t.takeID(id)
+	if !ok {
+		return false
 	}
-	t.mu.Unlock()
-
-	if ok {
-		t.manager.emit(WatchEvent{
-			Connected: false,
-			Info:      disconnectInfo(id, entry),
-		})
-		entry.cancelAndClose()
-	}
-	return ok
+	t.removeFromEmail(entry.Email, id)
+	t.manager.emit(WatchEvent{Connected: false, Info: snapshot(id, entry)})
+	entry.cancelAndClose()
+	return true
 }
 
 // GetConnCount returns the number of active connections for email.
 func (t *Tracker) GetConnCount(email string) int {
-	t.mu.Lock()
-	n := len(t.conns[email])
-	t.mu.Unlock()
+	es := t.emailShard(email)
+	es.mu.RLock()
+	n := len(es.byEmail[email])
+	es.mu.RUnlock()
 	return n
 }
 
 // ListConnections returns a snapshot of all currently active connections.
 func (t *Tracker) ListConnections() []ConnectionInfo {
-	t.mu.Lock()
-	result := make([]ConnectionInfo, 0, len(t.byID))
-	for id, entry := range t.byID {
-		info := disconnectInfo(id, entry)
-		info.Uplink = atomic.LoadInt64(&entry.uplink)
-		info.Downlink = atomic.LoadInt64(&entry.downlink)
-		result = append(result, info)
+	total := 0
+	for i := range t.ids {
+		t.ids[i].mu.RLock()
+		total += len(t.ids[i].byID)
+		t.ids[i].mu.RUnlock()
 	}
-	t.mu.Unlock()
+	result := make([]ConnectionInfo, 0, total)
+	for i := range t.ids {
+		s := &t.ids[i]
+		s.mu.RLock()
+		for id, entry := range s.byID {
+			result = append(result, snapshot(id, entry))
+		}
+		s.mu.RUnlock()
+	}
 	return result
 }
 

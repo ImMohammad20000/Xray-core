@@ -16,7 +16,7 @@ type accessRecordKey struct{}
 // AccessRecord captures accepted-request access-log state until the request
 // finishes and a final log line can be emitted.
 type AccessRecord struct {
-	ID uint32
+	ID uint64
 
 	Msg *clog.AccessMessage
 
@@ -90,7 +90,7 @@ func (m *Manager) NewAccessRecord(msg *clog.AccessMessage, cancel context.Cancel
 		return nil
 	}
 	record := &AccessRecord{
-		ID:     atomic.AddUint32(&m.globalNext, 1),
+		ID:     atomic.AddUint64(&m.globalNext, 1),
 		Msg:    msg,
 		cancel: cancel,
 	}

@@ -23,7 +23,7 @@ Arguments:
 	-t, -timeout <seconds>
 		Timeout in seconds for calling API. Default 3
 
-	-id <uint32>
+	-id <uint64>
 		The connection ID to close (required).
 
 Example:
@@ -47,7 +47,7 @@ func executeConnClose(cmd *base.Command, args []string) {
 
 	client := connService.NewConnTrackerServiceClient(conn)
 	resp, err := client.CloseConnection(ctx, &connService.CloseConnectionRequest{
-		Id: uint32(*id),
+		Id: uint64(*id),
 	})
 	if err != nil {
 		base.Fatalf("failed to close connection: %s", err)
